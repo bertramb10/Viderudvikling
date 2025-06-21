@@ -1,0 +1,36 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+const char* WIFI_SSID = "BertramPhone";
+const char* WIFI_PW   = "okayokay";
+const char* MQTT_HOST = "172.20.10.2";
+const char* BAT_BARCODE = "BAT-456";   // ← gemt i EEPROM eller modtaget én gang pr. box
+
+WiFiClient spine;
+PubSubClient mqtt(spine);
+
+void setup() {
+  Serial.begin(115200);
+  WiFi.begin(WIFI_SSID, WIFI_PW);
+  while (WiFi.status()!=WL_CONNECTED) delay(500);
+  mqtt.setServer(MQTT_HOST, 1883);
+  mqtt.connect("measure-esp");
+}
+
+void loop() {
+  if (!mqtt.connected()) mqtt.connect("measure-esp");
+  mqtt.loop();
+
+  StaticJsonDocument<256> doc;
+  doc["battery_barcode"] = BAT_BARCODE;
+  doc["temp"]  = random(240,320)/10.0;
+  JsonArray c  = doc.createNestedArray("cells");
+  for (int i=0;i<10;i++) c.add(4.20 - i*0.02);
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("battery/telemetry", buf, n);
+
+  delay(10000);                // hvert 10. sekund
+}
