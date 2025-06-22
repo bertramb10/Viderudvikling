@@ -15,11 +15,11 @@
 #include <Ticker.h>
 
 /* ---------- NETVÆRK ----------------------------- */
-const char* WIFI_SSID = "DIT_WIFI_NAVN";
-const char* WIFI_PW   = "DIT_WIFI_PASSWORD";
-const char* MQTT_HOST = "192.168.1.228";   // Raspberry-pi IP
-const int   MQTT_PORT = 1883;
-const char* boxBarcode = "BOX-09";         // ← unikt for DENNE kasse
+const char* WIFI_SSID = "DIT_WIFI_NAVN";     // indsæt hotspot ssid
+const char* WIFI_PW   = "DIT_WIFI_PASSWORD"; // indsæt hotspot password
+const char* MQTT_HOST = "192.168.1.228";   // Raspberry-pi IP (ændrer sig på dit netværk, tjek med "nmap -sn (din default gateway, typisk '172.xx.xx.x/28' på hotspot eller '192.168.1.1/24' på hjemmenetværk.) (tjek med ipconfig hvis det er fra en pc på samme netværk)
+const int   MQTT_PORT = 1883;               // mqtt port (8883 for krypteret) skal implementeres først
+const char* boxBarcode = "BOX-09";         // ← unikt for DENNE kasse. Der mangler en kode til scanning af stregkoder, logikken er forsøgt sat op i databasen også men ikke testet
 
 WiFiClient   wifiClient;
 PubSubClient mqtt(wifiClient);
