@@ -1,0 +1,216 @@
+/*****************************************************************
+ *  battery_box_sender.ino  ·  ESP32 måle- og MQTT-sender
+ *  - porteret 1-til-1 fra MicroPython-logik til Arduino C++
+ *  - sender JSON til topic  "battery/telemetry"
+ *****************************************************************/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Adafruit_NeoPixel.h>
+#include <ArduinoJson.h>
+#include <Ticker.h>
+
+/* ---------- NETVÆRK ----------------------------- */
+const char* WIFI_SSID = "DIT_WIFI_NAVN";
+const char* WIFI_PW   = "DIT_WIFI_PASSWORD";
+const char* MQTT_HOST = "192.168.1.228";   // Raspberry-pi IP
+const int   MQTT_PORT = 1883;
+const char* boxBarcode = "BOX-09";         // ← unikt for DENNE kasse
+
+WiFiClient   wifiClient;
+PubSubClient mqtt(wifiClient);
+
+/* ---------- PIN-KONSTANTER ---------------------- */
+constexpr uint8_t RELAY_MAIN_PIN = 4;
+constexpr uint8_t FAN_PIN        = 5;
+constexpr uint8_t BUTTON_PIN     = 16;
+constexpr uint8_t NEOPIXEL_PIN   = 15;
+constexpr uint8_t NUM_PIXELS     = 10;
+constexpr uint8_t SCL_PIN        = 21;
+constexpr uint8_t SDA_PIN        = 22;
+
+/* ---------- TEMPERATURE ------------------------- */
+constexpr uint8_t TEMP_PINS[]    = {2, 13};
+constexpr float TEMP_MAX = 35.0;
+constexpr float TEMP_MIN = 28.0;
+DallasTemperature tempBus1(new OneWire(TEMP_PINS[0]));
+DallasTemperature tempBus2(new OneWire(TEMP_PINS[1]));
+float lastTemp = 25.0;
+Ticker tempTicker;
+
+/* ---------- ADS1115 ----------------------------- */
+Adafruit_ADS1115 ads;
+
+/* ---------- NEOPIXEL ---------------------------- */
+Adafruit_NeoPixel np(NUM_PIXELS, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+/* ---------- RELÆER ------------------------------ */
+const uint8_t RELAY_PINS[NUM_PIXELS] = {19,18,32,33,25,26,27,14,12,23};
+
+/* ---------- STATE VARIABLER --------------------- */
+bool running = false;
+bool dischargeAllowed = true;
+std::set<uint8_t> lowVoltageCells;
+
+/* ---------- HELPER-FUNKTIONER ------------------- */
+void setAllPixels(uint32_t color) {
+  for (uint8_t i=0;i<NUM_PIXELS;i++) np.setPixelColor(i, color);
+  np.show();
+}
+void flashGreenDone() {
+  for(int j=0;j<5;j++){
+    setAllPixels(np.Color(0,255,0)); delay(300);
+    setAllPixels(0);                 delay(300);
+  }
+}
+float readSingleTemp() {
+  tempBus1.requestTemperatures(); tempBus2.requestTemperatures();
+  delay(750);
+  float t1 = tempBus1.getTempCByIndex(0);
+  float t2 = tempBus2.getTempCByIndex(0);
+  return (isnan(t1)?t2:(isnan(t2)?t1:(t1+t2)/2.0));
+}
+
+/* ---------- TEMP TICKER (5 sek) ----------------- */
+void tempLoop() {
+  lastTemp = readSingleTemp();
+  if (lastTemp >= TEMP_MAX) dischargeAllowed = false;
+  else if (lastTemp <= TEMP_MIN) dischargeAllowed = true;
+}
+
+/* ---------- WIFI / MQTT ------------------------- */
+void ensureMQTT() {
+  if (mqtt.connected()) return;
+  while (!mqtt.connected()) {
+    mqtt.connect("battery-sender");
+    if (!mqtt.connected()) delay(2000);
+  }
+}
+
+/* ---------- CELLEMÅLING ------------------------- */
+float measureCell(uint8_t idx) {
+  // Slå kun én relæ-kanal til ad gangen
+  for (uint8_t i=0;i<NUM_PIXELS;i++)
+    digitalWrite(RELAY_PINS[i], i==idx ? HIGH : LOW);
+
+  delay(1000);                                   // stabiliser
+  int16_t raw = ads.readADC_Differential_0_1();
+  return ads.computeVolts(raw);                  // 0-4 V
+}
+
+/* ---------- SEND MQTT-JSON ---------------------- */
+void sendTelemetry(float temp, const std::array<float,10>& cells) {
+  ensureMQTT();
+  StaticJsonDocument<256> doc;
+  doc["box_barcode"] = boxBarcode;
+  doc["temp"] = temp;
+  JsonArray c = doc.createNestedArray("cells");
+  for (float v : cells) c.add(v);
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  mqtt.publish("battery/telemetry", buf, n);
+  Serial.println("📤 MQTT: " + String(buf));
+}
+
+/* ---------- OPSÆTNING --------------------------- */
+void setup() {
+  Serial.begin(115200);
+
+  // IO
+  pinMode(RELAY_MAIN_PIN, OUTPUT);  digitalWrite(RELAY_MAIN_PIN, LOW);
+  pinMode(FAN_PIN,        OUTPUT);  digitalWrite(FAN_PIN,        LOW);
+  pinMode(BUTTON_PIN,     INPUT_PULLUP);
+  for (uint8_t p: RELAY_PINS) { pinMode(p, OUTPUT); digitalWrite(p, LOW); }
+
+  np.begin(); setAllPixels(0);
+
+  // ADS1115
+  Wire.begin(SDA_PIN, SCL_PIN);
+  ads.begin();
+  ads.setGain(GAIN_ONE);
+
+  // Temp sensorer
+  tempBus1.begin(); tempBus2.begin();
+
+  // WIFI
+  WiFi.begin(WIFI_SSID, WIFI_PW);
+  Serial.print("WiFi");
+  while (WiFi.status()!=WL_CONNECTED){delay(500);Serial.print(".");}
+  Serial.println(" OK");
+
+  mqtt.setServer(MQTT_HOST, MQTT_PORT);
+
+  // Start temperatur-ticker: hvert 5 sek
+  tempTicker.attach_ms(5000, tempLoop);
+
+  Serial.println("✔️  Setup færdig");
+}
+
+/* ---------- LOOP -------------------------------- */
+void loop() {
+  mqtt.loop();
+
+  /* start/stop via knap */
+  if (digitalRead(BUTTON_PIN)==LOW) {
+    delay(300);
+    while(digitalRead(BUTTON_PIN)==LOW);
+    running = !running;
+    Serial.println(running ? "▶️  START" : "⏹  STOP");
+    if (!running) {
+      digitalWrite(RELAY_MAIN_PIN, LOW);
+      digitalWrite(FAN_PIN,        LOW);
+      for (uint8_t p: RELAY_PINS) digitalWrite(p, LOW);
+      setAllPixels(0);
+    }
+  }
+
+  if (!running) { delay(100); return; }
+
+  /* ----- CELLEMÅLING + Afladning-styring ------ */
+  std::array<float,10> cells{};
+  lowVoltageCells.clear();
+
+  for (uint8_t idx=0; idx<NUM_PIXELS; idx++) {
+    setAllPixels(0);
+    np.setPixelColor(idx, np.Color(255,0,0)); np.show();
+
+    cells[idx] = measureCell(idx);
+    Serial.printf("Cell %02d: %.3f V\n", idx+1, cells[idx]);
+
+    if (cells[idx] > -0.8) lowVoltageCells.insert(idx);
+  }
+
+  /* ----- Afladning 10 sek styret af temperatur ---- */
+  uint32_t start = millis();
+  while (millis() - start < 10000) {
+    if (dischargeAllowed) {
+      np.fill(np.Color(255,100,0)); np.show();            // orange lys
+      digitalWrite(RELAY_MAIN_PIN, HIGH);
+      digitalWrite(FAN_PIN,        HIGH);
+    } else {
+      np.fill(np.Color(0,0,255));  np.show();             // blåt “pause”
+      digitalWrite(RELAY_MAIN_PIN, LOW);
+      digitalWrite(FAN_PIN,        LOW);
+    }
+    delay(500);
+  }
+  digitalWrite(RELAY_MAIN_PIN, LOW);
+  digitalWrite(FAN_PIN,        LOW);
+
+  /* ----- MQTT transmit -------------------------------- */
+  sendTelemetry(lastTemp, cells);
+
+  /* ----- Succes blink / stop-logik -------------------- */
+  if (lowVoltageCells.size()==NUM_PIXELS) {
+    Serial.println("✅ Alle celler under tærskel – afladning færdig");
+    flashGreenDone();
+    running = false;
+  }
+
+  delay(2000);   // kort pause før ny cyklus / eller næste start
+}
